@@ -273,6 +273,52 @@ class LauncherInteractiveTest(unittest.TestCase):
             self.assertTrue(pid_file.exists())
             self.assertTrue(Path(f"{pid_file}.token").exists())
 
+    def test_failed_launch_preserves_unrelated_vllm_worker(self):
+        for tagged in (True, False):
+            with self.subTest(tagged=tagged):
+                with tempfile.TemporaryDirectory() as directory:
+                    token = "launcher-test-failed-launch"
+                    startup = subprocess.Popen(
+                        ["sleep", "30"],
+                        start_new_session=True,
+                        env={**os.environ, "VLLM_LAUNCH_TOKEN": token},
+                    )
+                    # The old failure sweep matched every same-user VLLM::* process,
+                    # even when another endpoint had a different launch token.
+                    unrelated = subprocess.Popen(
+                        [
+                            "python3",
+                            "-c",
+                            "import ctypes,time; "
+                            "ctypes.CDLL(None).prctl(15, b'VLLM::Worker', 0, 0, 0); "
+                            "print('ready', flush=True); time.sleep(30)",
+                        ],
+                        start_new_session=True,
+                        stdout=subprocess.PIPE,
+                        env={**os.environ, "VLLM_LAUNCH_TOKEN": "unrelated-launch"},
+                    )
+                    pid_file = Path(directory) / "startup.pid"
+                    pid_file.write_text(f"{startup.pid}\n")
+                    if tagged:
+                        Path(f"{pid_file}.token").write_text(f"{token}\n")
+                    try:
+                        self.assertEqual(unrelated.stdout.readline(), b"ready\n")
+                        subprocess.run(
+                            ["bash", "-c", 'source ./launcher.sh; cleanup_failed_launch "$1"',
+                             "_", str(pid_file)],
+                            cwd=ROOT,
+                            check=True,
+                        )
+                        startup.wait(timeout=5)
+                        self.assertIsNone(unrelated.poll())
+                        self.assertFalse(pid_file.exists())
+                    finally:
+                        for process in (startup, unrelated):
+                            if process.poll() is None:
+                                process.terminate()
+                            process.wait(timeout=5)
+                        unrelated.stdout.close()
+
     def test_noninteractive_tty_does_not_read_startup_keys(self):
         output, code = run_tty(
             "source ./launcher.sh; NON_INTERACTIVE=1; "

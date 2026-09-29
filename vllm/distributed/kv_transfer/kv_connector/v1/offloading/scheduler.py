@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -1023,6 +1024,13 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
+        if logger.isEnabledFor(logging.DEBUG):  # No prompt text or token IDs.
+            logger.debug(
+                "KV prefix fingerprint request=%s prompt_tokens=%d block_hashes=%s",
+                request.request_id,
+                request.num_prompt_tokens,
+                ",".join(block_hash.hex() for block_hash in request.block_hashes),
+            )
         req_context = _create_req_context(request)
         offloading_context = self.manager.on_new_request(req_context)
         req_status = RequestOffloadState(

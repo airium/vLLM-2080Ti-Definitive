@@ -969,3 +969,57 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+def test_bounded_storage_promotes_touched_group_and_evicts_probationary(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    block_bytes = tensor.stride(0) * tensor.element_size()
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=1,
+        max_disk_bytes=2 * block_bytes - 1,
+        target_disk_bytes=block_bytes,
+        cleanup_interval_seconds=3600,
+    )
+    try:
+        first, second = key(101), key(102)
+        tier.submit_store(make_job(1, [first], [0]))
+        assert all(result.success for result in drain(tier))
+        tier.submit_store(make_job(2, [second], [1]))
+        assert all(result.success for result in drain(tier))
+
+        tier.touch([first], _CTX)
+        tier._run_cleanup()
+
+        assert os.path.exists(tier.file_mapper.get_file_name(first))
+        assert not os.path.exists(tier.file_mapper.get_file_name(second))
+        assert tier._cache_index is not None
+        assert tier._cache_index.total_bytes() == block_bytes
+    finally:
+        tier.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_disk_bytes": 8, "target_disk_bytes": 9}, "target_disk_bytes"),
+        ({"max_disk_bytes": 8, "target_disk_bytes": 0}, "target_disk_bytes"),
+        ({"target_disk_bytes": 8}, "requires max_disk_bytes"),
+        ({"max_disk_bytes": -1}, "max_disk_bytes"),
+        ({"cleanup_interval_seconds": 0}, "cleanup_interval_seconds"),
+    ],
+)
+def test_bounded_storage_config_validation(tmp_path, kwargs, message):
+    tensor = _page_aligned_zero_tensor(1, _BLOCK_ELEMENTS)
+    with pytest.raises(ValueError, match=message):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            **kwargs,
+        )

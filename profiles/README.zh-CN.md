@@ -14,6 +14,7 @@ profiles/
   2x2080Ti/   # [详细 Profile 说明与参考性能](2x2080Ti/README.zh-CN.md)
   4xT10/      # [详细 Profile 说明与参考性能](4xT10/README.zh-CN.md)
   2xT10/      # [详细 Profile 说明与参考性能](2xT10/README.zh-CN.md)
+  airium/     # 本地双 22 GiB Qwen 路线；参见根目录部署指南。
 ```
 
 Profile 文件名统一使用 `<解码类型>-<KV精度>-<并发数><上下文>-<消息类型>.env`。
@@ -28,7 +29,11 @@ Profile 文件名统一使用 `<解码类型>-<KV精度>-<并发数><上下文>-
 `MODEL_FAMILY`、`MODEL_VARIANT`、`QUANTIZATION`、`KV_CACHE_DTYPE`、
 `MAX_MODEL_LEN`、`GPU_UTIL`、`MAX_NUM_SEQS`、`MESSAGE_TYPE`、
 `SPECULATIVE_METHOD` 和 `SPECULATIVE_TOKENS`。可选路线字段为 `MODE`、
-`MAX_BATCHED_TOKENS` 和 `ENABLE_YARN`。
+`MAX_BATCHED_TOKENS`、`ENABLE_YARN`、`DISABLE_PREFIX_CACHING`、
+`MAMBA_CACHE_MODE`、`MM_LIMIT_JSON`、`LANGUAGE_MODEL_ONLY` 和
+`SKIP_MM_PROFILING`。省略 `MODE` 使用启动器默认值 `fast`，不会保留此前验证
+的 `normal` 策略。`MODEL_FAMILY=qwen35` 表示 Qwen3.8-27B 也使用的
+Qwen3.5 dense 架构，不是 checkpoint 名称。
 
 例如，将下面内容保存为
 `qwen27b/w8a16/mtp4-fp8kv-1x262K-text-only.env`：
@@ -50,6 +55,13 @@ MESSAGE_TYPE=text-only
 token 数；文件名中的并发数和 `K` 形式的上下文要分别匹配 `MAX_NUM_SEQS` 和
 `MAX_MODEL_LEN`；KV 与消息类型后缀也要匹配对应字段。手写完成后，先运行
 `bash tools/validate_profiles.sh` 校验，再使用该 Profile。
+
+本地 `airium/` 文件名还记录精确上下文 token 数和图片准入限制：`2x22g`
+描述 GPU 组合，不是请求并发数；`text-image5` 要求 `MM_LIMIT_JSON` 允许五张图片。
+本地 `dflashN` 标签表示 `SPECULATIVE_TOKENS` 数量，例如 `dflash7` 表示七个 token，
+方法仍为 `SPECULATIVE_METHOD=dflash`。draft 版本通过主机配置
+`SPECULATIVE_MODEL` 单独选择；本地七 token 路线使用 DFlash2。
+官方 `dflash2-*` 文件名表示该 draft 版本，不是两个 token。
 
 选择 profile 后，可执行 `./launcher.sh --print-config` 检查最终生效的路线参数，
 然后再启动服务。

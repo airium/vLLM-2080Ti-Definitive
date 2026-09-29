@@ -472,6 +472,61 @@ def test_independent_eagle_store_keeps_replay_window():
     ) == [True, True, True]
 
 
+def test_independent_draft_prefix_is_not_required_or_loaded():
+    """DFlash2 rebuilds unhashed draft buffers instead of restoring them."""
+    config = _make_vllm_config()
+    config.speculative_config = None
+    target = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    draft = SlidingWindowSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=16,
+        extra_retained_tokens=256,
+    )
+    cache = KVCacheConfig(
+        num_blocks=32,
+        num_blocks_per_group=(32, 32, 32),
+        independent_block_pools=True,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target.0"], target),
+            KVCacheGroupSpec(["draft"], draft, is_eagle_group=True),
+            KVCacheGroupSpec(["target.1"], target),
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(config, cache))
+    sched = OffloadingConnectorScheduler(spec, config, cache)
+    request = MagicMock()
+    request.request_id = "dflash-restart"
+    request.kv_transfer_params = None
+    request.num_tokens = request.num_prompt_tokens = 129
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
+    request.skip_reading_prefix_cache = False
+    sched.on_new_request(request)
+    sched.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if get_offload_group_idx(key) == 1 else LookupResult.HIT
+    )
+    external, load_async = sched.get_num_new_matched_tokens(request, 0)
+    assert external == 128 and load_async
+    sched.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            tuple([KVCacheBlock(i + 1) for i in range(8)] for _ in range(3))
+        ),
+        num_external_tokens=external,
+    )
+    [job] = sched._current_batch_load_jobs.values()
+    assert job.dst_spec.group_sizes == [8, 8]
+    assert job.dst_spec.block_indices == [0, 0]
+    keys = job.src_spec.offload_keys
+    assert {get_offload_group_idx(key) for key in keys} == {0, 2}
+    assert len(keys) == 16
+
+
 def test_normal_store_excludes_align_mode_mamba_sources():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(scheduler)

@@ -16,6 +16,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -372,9 +375,40 @@ def test_worker_kv_bytes_with_independent_block_pools():
         _make_vllm_config(), kv_cache_config
     )
 
-    assert offloading_config.worker_kv_bytes_per_block == (
-        target.page_size_bytes + draft.page_size_bytes
+    assert offloading_config.worker_kv_bytes_per_block == target.page_size_bytes
+    assert [group.group_id for group in offloading_config.groups] == [0]
+
+
+@pytest.mark.parametrize("independent", [False, True])
+def test_offload_selection_preserves_target_group_ids(independent):
+    """Only independent draft pools are excluded, even between target groups."""
+    spec = _full_attention_spec()
+    groups = [
+        KVCacheGroupSpec(["target.0"], spec),
+        KVCacheGroupSpec(["draft"], spec, is_eagle_group=True),
+        KVCacheGroupSpec(["target.1"], spec),
+    ]
+    cache = KVCacheConfig(
+        num_blocks=8,
+        num_blocks_per_group=(8, 8, 8) if independent else None,
+        independent_block_pools=independent,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
     )
+    config = _make_vllm_config()
+    offloading = build_offloading_config(config, cache)
+    expected = [0, 2] if independent else [0, 1, 2]
+    assert [group.group_id for group in offloading.groups] == expected
+    assert offloading.worker_kv_bytes_per_block == len(expected) * spec.page_size_bytes
+    scheduler = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading), config, cache
+    )
+    assert [group.group_idx for group in scheduler.kv_group_configs] == expected
+    connector = object.__new__(OffloadingConnector)
+    connector._kv_cache_config = cache
+    connector._kv_cache_manager = None
+    assert connector._bounding_group_ids == ()
+    assert connector._max_loadable_tokens(MagicMock(), 0) is None
 
 
 def test_zero_blocks_with_independent_pools_do_not_allocate_offload_staging():
@@ -425,6 +459,9 @@ def test_hisparse_offloads_only_indexer_group():
         (group.group_id, group.layer_names) for group in offloading_config.groups
     ] == [(1, ("indexer",))]
     assert [group.group_idx for group in scheduler_config.kv_group_configs] == [1]
+    connector = object.__new__(OffloadingConnector)
+    connector._kv_cache_config = kv_cache_config
+    assert connector._bounding_group_ids == (0,)
 
 
 def test_hisparse_partial_group_size_survives_scheduler_flattening():

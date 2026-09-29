@@ -40,7 +40,9 @@ required_keys=(
 allowed_key() {
   case "$1" in
     MODE|MODEL_FAMILY|MODEL_VARIANT|QUANTIZATION|KV_CACHE_DTYPE|MAX_MODEL_LEN|GPU_UTIL|\
-MAX_BATCHED_TOKENS|MAX_NUM_SEQS|MESSAGE_TYPE|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|ENABLE_YARN)
+MAX_BATCHED_TOKENS|MAX_NUM_SEQS|MESSAGE_TYPE|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|\
+DISABLE_PREFIX_CACHING|MAMBA_CACHE_MODE|MM_LIMIT_JSON|LANGUAGE_MODEL_ONLY|\
+SKIP_MM_PROFILING|ENABLE_YARN)
       return 0
       ;;
     *)
@@ -80,6 +82,9 @@ expected_profiles=(
   4xT10/qwen27b/w8a16/dflash2-fp8kv-2x220K-text-only.env
   4xT10/qwen27b/w8a16/mtp4-fp8kv-2x262K-text-image.env
   4xT10/qwen27b/w8a16/mtp4-fp16kv-1x262K-text-image.env
+  airium/qwen3.8-27b-2x22g-w4a16-fp8kv-262144-dflash7-text-image5.env
+  airium/qwen3.8-27b-2x22g-w8a16-fp8kv-225280-mtp3-text-image5.env
+  airium/qwen3.8-27b-2x22g-w8a16-tqk8v4-262144-mtp4-text-image5.env
 )
 mapfile -t expected_profiles < <(printf '%s\n' "${expected_profiles[@]}" | sort)
 
@@ -170,12 +175,43 @@ while IFS= read -r -d '' file; do
     if [[ "$speculative_tokens" != "$mtp_label" ]]; then
       profile_error "$rel" "filename MTP token count does not match SPECULATIVE_TOKENS=$speculative_tokens"
     fi
+    [[ "$speculative_method" == mtp ]] || profile_error "$rel" "mtp filename requires SPECULATIVE_METHOD=mtp"
   fi
   if [[ "$profile_name" == nomtp-* && "$speculative_method" != none ]]; then
     profile_error "$rel" "nomtp filename requires SPECULATIVE_METHOD=none"
   fi
-  if [[ "$profile_name" == dflash* && "$speculative_method" != dflash ]]; then
+  if [[ "$profile_name" =~ (^|-)dflash[0-9]*- && "$speculative_method" != dflash ]]; then
     profile_error "$rel" "dflash filename requires SPECULATIVE_METHOD=dflash"
+  fi
+  # Local dflashN labels count draft tokens; official dflash2 labels identify
+  # the draft-model generation instead, so leave that upstream convention intact.
+  if [[ "$rel" == airium/* && "$profile_name" =~ -dflash([0-9]+)- ]]; then
+    [[ "$speculative_tokens" == "${BASH_REMATCH[1]}" ]] || \
+      profile_error "$rel" "filename DFlash token count does not match SPECULATIVE_TOKENS=$speculative_tokens"
+  fi
+  # Local names record exact context tokens and image admission, unlike the
+  # hardware profiles' decimal-K context labels. 2x22g names hardware, not
+  # request concurrency.
+  if [[ "$profile_name" =~ -([1-9][0-9]*)-(mtp[0-9]+|dflash[0-9]*)- ]]; then
+    [[ "${BASH_REMATCH[1]}" == "$(read_profile_value "$file" MAX_MODEL_LEN)" ]] || \
+      profile_error "$rel" "filename exact context does not match MAX_MODEL_LEN"
+  fi
+  if [[ "$profile_name" =~ -text-image([1-9][0-9]*)\.env$ ]]; then
+    expected_images=${BASH_REMATCH[1]}
+    mm_limit=$(read_profile_value "$file" MM_LIMIT_JSON)
+    if ! python3 - "$mm_limit" "$expected_images" <<'PY'
+import json
+import sys
+try:
+    limits = json.loads(sys.argv[1])
+    valid = limits.get("image") == int(sys.argv[2])
+except (ValueError, AttributeError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+    then
+      profile_error "$rel" "filename image count does not match MM_LIMIT_JSON"
+    fi
   fi
   if [[ "$profile_name" =~ -([1-9][0-9]*)x[0-9]+[kK]- ]]; then
     expected_seqs=${BASH_REMATCH[1]}
@@ -199,7 +235,7 @@ while IFS= read -r -d '' file; do
   esac
   case "$profile_name" in
     *text-only.env) [[ "$message_type" == text-only ]] || profile_error "$rel" "text-only filename requires MESSAGE_TYPE=text-only" ;;
-    *text-image.env) [[ "$message_type" == text+image ]] || profile_error "$rel" "text-image filename requires MESSAGE_TYPE=text+image" ;;
+    *text-image*.env) [[ "$message_type" == text+image ]] || profile_error "$rel" "text-image filename requires MESSAGE_TYPE=text+image" ;;
   esac
   case "$speculative_method" in
     none)

@@ -56,12 +56,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
         Never offer tokens for a range some group cannot cover: past such a
         group's own cached prefix its KV would be left unwritten.
+        Independent draft pools are rebuilt, not prefix-cache dependencies.
         """
         offloaded = set(get_offloading_group_ids(self._kv_cache_config))
         return tuple(
             group_id
             for group_id, group in enumerate(self._kv_cache_config.kv_cache_groups)
-            if group.kv_cache_spec.prefix_cacheable and group_id not in offloaded
+            if group.kv_cache_spec.prefix_cacheable
+            and group_id not in offloaded
+            and not (
+                self._kv_cache_config.independent_block_pools and group.is_eagle_group
+            )
         )
 
     @property

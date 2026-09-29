@@ -273,6 +273,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         # the Ray and multiprocessing paths), so it names a per-replica offload
         # region.
         self._engine_id = config.engine_id
+        self.pin_memory = self.extra_config.get("pin_memory", True)
+        if not isinstance(self.pin_memory, bool):
+            raise ValueError("pin_memory must be a boolean")
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -407,6 +410,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
+                use_pin_memory=self.pin_memory,
             )
         except Exception:
             worker_mmap.cleanup()

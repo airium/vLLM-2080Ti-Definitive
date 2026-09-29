@@ -18,6 +18,7 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
+import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
@@ -54,6 +55,7 @@ from vllm.v1.kv_offload.tiering.fs.io import (
     batch_store_block,
     probe_o_direct,
 )
+from vllm.v1.kv_offload.tiering.fs.cache_index import FileSystemCacheIndex
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
 if TYPE_CHECKING:
@@ -77,6 +79,7 @@ class FsAsyncLookupManager(AsyncLookupManager):
         self, keys: list[OffloadKey], req_context: ReqContext
     ) -> Iterable[bool]:
         paths = [self._tier.file_mapper.get_file_name(k) for k in keys]
+        self._tier.reserve_lookup_paths(req_context.req_id, paths)
         if _HAS_BATCH_LOOKUP_C:
             # C extension: GIL released for the entire faccessat() batch.
             return batch_lookup_C(paths)
@@ -117,6 +120,10 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        max_disk_bytes: int = 0,
+        target_disk_bytes: int | None = None,
+        min_disk_free_bytes: int = 0,
+        cleanup_interval_seconds: float = 60.0,
     ):
         """
         Args:
@@ -135,6 +142,16 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
+        self.max_disk_bytes = self._validate_non_negative("max_disk_bytes", max_disk_bytes)
+        self.min_disk_free_bytes = self._validate_non_negative("min_disk_free_bytes", min_disk_free_bytes)
+        self.target_disk_bytes = self.max_disk_bytes if target_disk_bytes is None else self._validate_non_negative("target_disk_bytes", target_disk_bytes)
+        if self.max_disk_bytes and not (0 < self.target_disk_bytes <= self.max_disk_bytes):
+            raise ValueError("target_disk_bytes must be > 0 and <= max_disk_bytes")
+        if not self.max_disk_bytes and self.target_disk_bytes:
+            raise ValueError("target_disk_bytes requires max_disk_bytes")
+        if isinstance(cleanup_interval_seconds, bool) or not isinstance(cleanup_interval_seconds, (int, float)) or cleanup_interval_seconds <= 0:
+            raise ValueError("cleanup_interval_seconds must be > 0")
+        self.cleanup_interval_seconds = float(cleanup_interval_seconds)
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -159,6 +176,8 @@ class FileSystemTierManager(SecondaryTierManager):
         # the GIL that read cannot observe the finished job without the prior
         # write, so no extra lock is needed (get_finished is itself lock-free).
         self._load_progress: dict[JobId, int] = {}
+        self._job_leases: dict[JobId, tuple[str, list[str]]] = {}
+        self._lookup_lease_owners: set[str] = set()
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -182,6 +201,20 @@ class FileSystemTierManager(SecondaryTierManager):
                 json.dump(
                     self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
                 )
+
+        self._cache_index: FileSystemCacheIndex | None = None
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        if self.max_disk_bytes or self.min_disk_free_bytes:
+            self._cache_index = FileSystemCacheIndex(root_dir=root_dir)
+            self._cache_index.reconcile()
+            self._run_cleanup()
+            self._cleanup_thread = threading.Thread(
+                target=self._cleanup_worker,
+                name="vllm_kv_fs_cleanup",
+                daemon=True,
+            )
+            self._cleanup_thread.start()
 
         # Prefer O_DIRECT to bypass the page cache, but fall back to buffered
         # I/O on filesystems that reject it (e.g. overlayfs, some NFS mounts)
@@ -214,9 +247,67 @@ class FileSystemTierManager(SecondaryTierManager):
             return LookupResult.RETRY
         return LookupResult.HIT if result else LookupResult.MISS
 
+    @staticmethod
+    def _validate_non_negative(name: str, value: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return value
+
+    def reserve_lookup_paths(self, req_id: str, paths: Iterable[str]) -> None:
+        if self._cache_index is None:
+            return
+        owner = f"lookup:{req_id}"
+        self._cache_index.reserve(paths, owner)
+        self._lookup_lease_owners.add(owner)
+
+    def _release_lookup_paths(self, req_id: str) -> None:
+        if self._cache_index is None:
+            return
+        owner = f"lookup:{req_id}"
+        self._cache_index.release(owner)
+        self._lookup_lease_owners.discard(owner)
+
+    def _reserve_job_paths(self, job_id: JobId, paths: list[str]) -> None:
+        if self._cache_index is None:
+            return
+        owner = f"job:{job_id}"
+        self._cache_index.reserve(paths, owner)
+        self._job_leases[job_id] = (owner, paths)
+
+    def _complete_job_lease(self, job_id: JobId, success: bool, *, store: bool = False, load_keys: list[OffloadKey] | None = None) -> None:
+        lease = self._job_leases.pop(job_id, None)
+        if self._cache_index is not None:
+            if success and store and lease is not None:
+                self._cache_index.record_store(lease[1])
+            elif success and not store and lease is not None:
+                self._cache_index.mark_access(lease[1])
+            elif not success and load_keys is not None:
+                self._cache_index.remove_missing(
+                    self.file_mapper.get_file_name(key) for key in load_keys
+                )
+            if lease is not None:
+                self._cache_index.release(lease[0])
+
+    def _run_cleanup(self) -> None:
+        if self._cache_index is not None:
+            self._cache_index.cleanup(
+                self.max_disk_bytes,
+                self.target_disk_bytes,
+                self.min_disk_free_bytes,
+            )
+
+    def _cleanup_worker(self) -> None:
+        while not self._cleanup_stop.wait(self.cleanup_interval_seconds):
+            try:
+                self._run_cleanup()
+            except Exception:
+                logger.exception("Filesystem KV cache cleanup failed")
+
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         keys = list(job_metadata.keys)
+        paths = [self.file_mapper.get_file_name(key) for key in keys]
+        self._reserve_job_paths(job_metadata.job_id, paths)
         if self.events is not None:
             self._store_job_keys[job_metadata.job_id] = keys
         task = functools.partial(
@@ -227,7 +318,11 @@ class FileSystemTierManager(SecondaryTierManager):
             self._block_size,
             self._use_o_direct,
         )
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        try:
+            self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        except Exception:
+            self._complete_job_lease(job_metadata.job_id, False)
+            raise
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -237,6 +332,7 @@ class FileSystemTierManager(SecondaryTierManager):
         keys = list(job_metadata.keys)
         self._load_job_keys[job_id] = keys
         paths = [self.file_mapper.get_file_name(key) for key in keys]
+        self._reserve_job_paths(job_id, paths)
         offsets = [int(cid) * self._block_size for cid in job_metadata.chunk_ids]
 
         def load_task() -> None:
@@ -266,7 +362,11 @@ class FileSystemTierManager(SecondaryTierManager):
                 )
                 raise
 
-        self._pool.enqueue_load(job_id, 1, [load_task])
+        try:
+            self._pool.enqueue_load(job_id, 1, [load_task])
+        except Exception:
+            self._complete_job_lease(job_id, False, load_keys=keys)
+            raise
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -295,6 +395,7 @@ class FileSystemTierManager(SecondaryTierManager):
                 successful = load_keys[:num_succeeded]
                 failed = load_keys[num_succeeded:]
                 self._lookup_manager.mark_miss(failed)
+                self._complete_job_lease(job_id, False, load_keys=failed)
                 results.append(
                     JobResult(
                         job_id=job_id,
@@ -304,6 +405,7 @@ class FileSystemTierManager(SecondaryTierManager):
                     )
                 )
                 continue
+            self._complete_job_lease(job_id, success, store=load_keys is None, load_keys=load_keys)
             results.append(
                 JobResult(
                     job_id=job_id,
@@ -326,6 +428,14 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
+        self._release_lookup_paths(req_context.req_id)
+
+    @override
+    def touch(self, keys: Iterable[OffloadKey], req_context: ReqContext):
+        if self._cache_index is not None:
+            self._cache_index.mark_access(
+                self.file_mapper.get_file_name(key) for key in keys
+            )
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -339,5 +449,16 @@ class FileSystemTierManager(SecondaryTierManager):
         Shuts down the lookup manager and the thread pool,
         clearing pending tasks and waiting for active threads to complete.
         """
+        self._cleanup_stop.set()
+        if self._cleanup_thread is not None:
+            self._cleanup_thread.join()
         self._lookup_manager.shutdown()
+        if self._cache_index is not None:
+            for owner in self._lookup_lease_owners:
+                self._cache_index.release(owner)
+            for owner, _ in self._job_leases.values():
+                self._cache_index.release(owner)
+            self._lookup_lease_owners.clear()
+            self._job_leases.clear()
+            self._cache_index.close()
         self._pool.shutdown(wait=True)

@@ -34,12 +34,19 @@ if TYPE_CHECKING:
 
 
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
-    if kv_cache_config.hisparse_host_num_blocks is None:
-        return tuple(range(len(kv_cache_config.kv_cache_groups)))
+    # IsolatedKVCacheCoordinator reuses only target KV. Independent DFlash2
+    # draft pools are rebuilt per admission and mask cache-restored target
+    # tokens; their retained prompt buffers are not reusable prefix artifacts.
+    # Apply this at the shared boundary so scheduler and worker select the
+    # same groups and CPU staging does not include those transient buffers.
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-        if group.role is KVCacheGroupRole.HISPARSE_INDEXER
+        if (
+            kv_cache_config.hisparse_host_num_blocks is None
+            or group.role is KVCacheGroupRole.HISPARSE_INDEXER
+        )
+        and not (kv_cache_config.independent_block_pools and group.is_eagle_group)
     )
 
 

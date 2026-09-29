@@ -14,7 +14,7 @@ source "$PROJECT_RELEASE_FILE"
 RUNTIME_ROOT=${RUNTIME_ROOT:-"$MANAGER_ROOT"}
 PROFILE_DIR=${PROFILE_DIR:-"$MANAGER_ROOT/profiles"}
 TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
-LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
+LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/run-logs"}
 STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
 MODEL_HISTORY_LIMIT=10
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -41,7 +41,7 @@ EOF
 
 pid_is_running() {
   local pid=${1:-}
-  [[ -n "$pid" && -d "/proc/$pid" ]]
+  [[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]] && pid_is_active "$pid"
 }
 
 pid_file_service_name() {
@@ -834,6 +834,11 @@ ROUTE_PROFILE_KEYS=(
   MAX_NUM_SEQS
   SPECULATIVE_METHOD
   SPECULATIVE_TOKENS
+  DISABLE_PREFIX_CACHING
+  MAMBA_CACHE_MODE
+  MM_LIMIT_JSON
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
   MESSAGE_TYPE
 )
 
@@ -849,6 +854,11 @@ PROFILE_RESET_KEYS=(
   MAX_NUM_SEQS
   SPECULATIVE_METHOD
   SPECULATIVE_TOKENS
+  DISABLE_PREFIX_CACHING
+  MAMBA_CACHE_MODE
+  MM_LIMIT_JSON
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
   MESSAGE_TYPE
 )
 
@@ -915,6 +925,16 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   FLASHINFER_ENABLE_AOT
   FLASHINFER_WORKSPACE_BASE
   RUN_HOME
+  VLLM_TQ_RESERVE_PREFILL_WORKSPACE
+  KV_ROOT
+  KV_CPU_GIB
+  KV_PIN_MEMORY
+  KV_PYTHONHASHSEED
+  PYTHONHASHSEED
+  KV_DISK_MAX_GIB
+  KV_DISK_TARGET_GIB
+  KV_DISK_MIN_FREE_GIB
+  KV_DISK_CLEANUP_INTERVAL_SECONDS
 )
 
 NON_INTERACTIVE_BOOLEAN_KEYS=(
@@ -939,6 +959,7 @@ NON_INTERACTIVE_BOOLEAN_KEYS=(
   VLLM_INT8KV_FA_PREFILL
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH
   SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION
+  KV_PIN_MEMORY
 )
 
 declare -A CONFIG_FLAG_TO_KEY=()
@@ -1175,7 +1196,9 @@ reset_route_profile_fields() {
 profile_key_is_allowed() {
   case "$1" in
 MODE|MODEL_FAMILY|MODEL_VARIANT|QUANTIZATION|KV_CACHE_DTYPE|ENABLE_YARN|MAX_MODEL_LEN|GPU_UTIL|\
-MAX_BATCHED_TOKENS|MAX_NUM_SEQS|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|MESSAGE_TYPE)
+MAX_BATCHED_TOKENS|MAX_NUM_SEQS|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|\
+DISABLE_PREFIX_CACHING|MAMBA_CACHE_MODE|MM_LIMIT_JSON|LANGUAGE_MODEL_ONLY|\
+SKIP_MM_PROFILING|MESSAGE_TYPE)
       return 0
       ;;
     *)
@@ -1424,6 +1447,20 @@ save_manager_state() {
     printf 'DISABLE_CUSTOM_ALL_REDUCE=%q\n' "${DISABLE_CUSTOM_ALL_REDUCE:-}"
     printf 'DISABLE_LOG_STATS=%q\n' "${DISABLE_LOG_STATS:-}"
     printf 'VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=%q\n' "${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-}"
+    printf 'VLLM_TQ_RESERVE_PREFILL_WORKSPACE=%q\n' "${VLLM_TQ_RESERVE_PREFILL_WORKSPACE:-}"
+    printf 'KV_ROOT=%q\n' "${KV_ROOT:-}"
+    printf 'KV_CPU_GIB=%q\n' "${KV_CPU_GIB:-}"
+    printf 'KV_PIN_MEMORY=%q\n' "${KV_PIN_MEMORY:-}"
+    printf 'KV_PYTHONHASHSEED=%q\n' "${KV_PYTHONHASHSEED:-}"
+    if [[ -n "${PYTHONHASHSEED:-}" ]]; then
+      printf 'export PYTHONHASHSEED=%q\n' "$PYTHONHASHSEED"
+    else
+      printf 'unset PYTHONHASHSEED\n'
+    fi
+    printf 'KV_DISK_MAX_GIB=%q\n' "${KV_DISK_MAX_GIB:-}"
+    printf 'KV_DISK_TARGET_GIB=%q\n' "${KV_DISK_TARGET_GIB:-}"
+    printf 'KV_DISK_MIN_FREE_GIB=%q\n' "${KV_DISK_MIN_FREE_GIB:-}"
+    printf 'KV_DISK_CLEANUP_INTERVAL_SECONDS=%q\n' "${KV_DISK_CLEANUP_INTERVAL_SECONDS:-}"
     printf 'MODE=%q\n' "${MODE:-fast}"
     printf 'PORT=%q\n' "${PORT:-8000}"
     printf 'SERVICE_SCOPE=%q\n' "${SERVICE_SCOPE:-local}"
@@ -1745,7 +1782,35 @@ current_prefix_cache_label() {
   fi
 }
 
+normalize_disk_kv_cache_config() {
+  # Keep the private/public KV_ROOT overlay compatible with upstream's byte-
+  # based interface, but use one connector and one checkpoint-isolated root.
+  if [[ -n "${KV_ROOT:-}" ]]; then
+    local root=$KV_ROOT cpu_bytes
+    [[ "$root" == /* ]] || root="$MANAGER_ROOT/$root"
+    root=$(realpath -m -- "$root")
+    if [[ -n "${KV_DISK_CACHE_DIR:-}" && "$(realpath -m -- "$KV_DISK_CACHE_DIR")" != "$root" ]]; then
+      echo "ERROR: KV_ROOT and KV_DISK_CACHE_DIR refer to different directories." >&2
+      return 1
+    fi
+    if [[ ! "${KV_CPU_GIB:-}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: KV_CPU_GIB must be a positive integer when KV_ROOT is set." >&2
+      return 1
+    fi
+    cpu_bytes=$((KV_CPU_GIB * 1024 * 1024 * 1024))
+    if [[ -n "${KV_DISK_CPU_BYTES:-}" && "$KV_DISK_CPU_BYTES" != "$cpu_bytes" ]]; then
+      echo "ERROR: KV_CPU_GIB and KV_DISK_CPU_BYTES specify different capacities." >&2
+      return 1
+    fi
+    KV_DISK_CACHE_DIR=$root
+    KV_DISK_CPU_BYTES=$cpu_bytes
+    KV_PIN_MEMORY=${KV_PIN_MEMORY:-false}
+  fi
+  configure_kv_hash_seed
+}
+
 validate_disk_kv_cache_config() {
+  normalize_disk_kv_cache_config || return 1
   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
   if [[ "$KV_DISK_CACHE_DIR" != /* ]]; then
     echo "ERROR: KV_DISK_CACHE_DIR must be an absolute path." >&2
@@ -1763,6 +1828,26 @@ validate_disk_kv_cache_config() {
     echo "ERROR: Disk KV cache requires PYTHONHASHSEED=0 across restarts." >&2
     return 1
   fi
+  local key
+  for key in KV_DISK_MAX_GIB KV_DISK_TARGET_GIB KV_DISK_MIN_FREE_GIB KV_DISK_CLEANUP_INTERVAL_SECONDS; do
+    if [[ -n "${!key:-}" && ! "${!key}" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: $key must be a non-negative integer." >&2
+      return 1
+    fi
+  done
+  if (( ${KV_DISK_MAX_GIB:-0} > 0 )); then
+    if ! (( ${KV_DISK_TARGET_GIB:-0} > 0 && ${KV_DISK_TARGET_GIB:-0} <= KV_DISK_MAX_GIB )); then
+      echo "ERROR: KV_DISK_TARGET_GIB must be > 0 and <= KV_DISK_MAX_GIB." >&2
+      return 1
+    fi
+  elif (( ${KV_DISK_TARGET_GIB:-0} > 0 )); then
+    echo "ERROR: KV_DISK_TARGET_GIB requires KV_DISK_MAX_GIB." >&2
+    return 1
+  fi
+  if [[ -n "${KV_DISK_CLEANUP_INTERVAL_SECONDS:-}" ]] && (( KV_DISK_CLEANUP_INTERVAL_SECONDS == 0 )); then
+    echo "ERROR: KV_DISK_CLEANUP_INTERVAL_SECONDS must be greater than zero." >&2
+    return 1
+  fi
 }
 
 disk_kv_transfer_config() {
@@ -1770,23 +1855,39 @@ disk_kv_transfer_config() {
     echo "ERROR: Disk KV cache checkpoint fingerprint is missing." >&2
     return 1
   fi
-  python3 - "$KV_DISK_CACHE_DIR" "$KV_DISK_CPU_BYTES" "$DISK_KV_CHECKPOINT_FINGERPRINT" <<'PY'
+  local pin_memory=""
+  if [[ -n "${KV_PIN_MEMORY:-}" ]]; then
+    pin_memory=false
+    [[ "$(normalize_bool "$KV_PIN_MEMORY")" == 1 ]] && pin_memory=true
+  fi
+  python3 - "$KV_DISK_CACHE_DIR" "$KV_DISK_CPU_BYTES" "$DISK_KV_CHECKPOINT_FINGERPRINT" \
+    "$pin_memory" "${KV_DISK_MAX_GIB:-}" "${KV_DISK_TARGET_GIB:-}" \
+    "${KV_DISK_MIN_FREE_GIB:-}" "${KV_DISK_CLEANUP_INTERVAL_SECONDS:-}" <<'PY'
 import json
 import os
 import sys
 
-root_dir, cpu_bytes, fingerprint = sys.argv[1:]
+root_dir, cpu_bytes, fingerprint, pin_memory, max_gib, target_gib, free_gib, interval = sys.argv[1:]
+tier = {
+    "type": "fs",
+    "root_dir": os.path.join(root_dir, f"checkpoint-{fingerprint}"),
+}
+for key, value in (("max_disk_bytes", max_gib), ("target_disk_bytes", target_gib), ("min_disk_free_bytes", free_gib)):
+    if value:
+        tier[key] = int(value) * 1024**3
+if interval:
+    tier["cleanup_interval_seconds"] = int(interval)
+extra = {
+    "cpu_bytes_to_use": int(cpu_bytes),
+    "spec_name": "TieringOffloadingSpec",
+    "secondary_tiers": [tier],
+}
+if pin_memory:
+    extra["pin_memory"] = pin_memory == "true"
 print(json.dumps({
     "kv_connector": "OffloadingConnector",
     "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-        "cpu_bytes_to_use": int(cpu_bytes),
-        "spec_name": "TieringOffloadingSpec",
-        "secondary_tiers": [{
-            "type": "fs",
-            "root_dir": os.path.join(root_dir, f"checkpoint-{fingerprint}"),
-        }],
-    },
+    "kv_connector_extra_config": extra,
 }, separators=(",", ":")))
 PY
 }
@@ -3443,6 +3544,8 @@ edit_advanced_parameters() {
     ENABLE_PREFIX_CACHING=0
     KV_DISK_CACHE_DIR=""
     KV_DISK_CPU_BYTES=""
+    KV_ROOT=""
+    KV_CPU_GIB=""
   fi
   CUSTOM_ALL_REDUCE_MODE=$(prompt_optional "Custom all-reduce mode (auto/off)" "${CUSTOM_ALL_REDUCE_MODE:-auto}") || return 0
   unset DISABLE_CUSTOM_ALL_REDUCE
@@ -3547,6 +3650,8 @@ edit_prefix_cache_menu() {
       ENABLE_PREFIX_CACHING=0
       KV_DISK_CACHE_DIR=""
       KV_DISK_CPU_BYTES=""
+      KV_ROOT=""
+      KV_CPU_GIB=""
       ;;
     *)
       ENABLE_PREFIX_CACHING=1
@@ -3565,7 +3670,7 @@ edit_disk_kv_cache_menu() {
   if [[ "$choice" == enabled ]]; then
     dir=$(prompt_default "SSD cache directory" "${KV_DISK_CACHE_DIR:-/mnt/nvme/vllm-kv-cache}") || return 0
     cpu_bytes=$(prompt_default "CPU staging bytes" "${KV_DISK_CPU_BYTES:-4294967296}") || return 0
-    if ! KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes validate_disk_kv_cache_config; then
+    if ! KV_ROOT="" KV_CPU_GIB="" KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes validate_disk_kv_cache_config; then
       return 1
     fi
     KV_DISK_CACHE_DIR=$dir
@@ -3574,6 +3679,8 @@ edit_disk_kv_cache_menu() {
     KV_DISK_CACHE_DIR=""
     KV_DISK_CPU_BYTES=""
   fi
+  KV_ROOT=""
+  KV_CPU_GIB=""
   save_manager_state
 }
 
@@ -4036,7 +4143,6 @@ stop_pid_file() {
       wait_recorded_pids_stopped "$descendants" 10 || true
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
-      cleanup_vllm_worker_residuals || true
       rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
@@ -4048,7 +4154,6 @@ stop_pid_file() {
     pid_is_running "$pid" || {
       stop_recorded_pids "$descendants" force || true
       wait_recorded_pids_stopped "$descendants" 10 || true
-      cleanup_vllm_worker_residuals force || true
       rm -f "$pid_file" "${pid_file}.token"
       return 0
     }
@@ -4124,66 +4229,14 @@ stop_pid_tree() {
   fi
 }
 
-cleanup_vllm_residuals() {
-  local port=${1:-}
-  local served_name=${2:-}
-  local model_dir=${3:-}
-  local pid cmd
-
-  while IFS= read -r pid; do
-    [[ -n "$pid" && "$pid" != "$$" ]] || continue
-    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
-    [[ "$cmd" == *"vllm.entrypoints.openai.api_server"* ]] || continue
-    if [[ -n "$port" && "$cmd" != *"--port $port"* && "$cmd" != *"--port=${port}"* ]]; then
-      if [[ -z "$served_name" || "$cmd" != *"$served_name"* ]]; then
-        if [[ -z "$model_dir" || "$cmd" != *"$model_dir"* ]]; then
-          continue
-        fi
-      fi
-    fi
-    stop_pid_tree "$pid" || true
-  done < <(pgrep -f 'vllm.entrypoints.openai.api_server' 2>/dev/null || true)
-}
-
-cleanup_vllm_worker_residuals() {
-  local mode=${1:-term}
-  local signal owner pid user comm
-
-  signal=TERM
-  [[ "$mode" == "force" ]] && signal=KILL
-  owner=$(id -un)
-  while read -r pid user comm; do
-    [[ -n "$pid" && "$pid" != "$$" ]] || continue
-    [[ "$user" == "$owner" ]] || continue
-    case "$comm" in
-      VLLM::*|python)
-        ;;
-      *)
-        continue
-        ;;
-    esac
-    if [[ "$comm" != VLLM::* ]]; then
-      tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'multiprocessing.resource_tracker' || continue
-    fi
-    kill "-$signal" "$pid" 2>/dev/null || true
-  done < <(ps -eo pid=,user=,comm= 2>/dev/null)
-}
-
 cleanup_failed_launch() {
   local pid_file=${1:-}
-  local pid
 
-  if [[ -n "$pid_file" && -f "$pid_file" ]]; then
-    pid=$(cat "$pid_file" 2>/dev/null || true)
-    stop_pid_tree "$pid" || true
-    sleep 1
-    stop_pid_tree "$pid" force || true
-    rm -f "$pid_file" "${pid_file}.token"
-  fi
-  cleanup_vllm_residuals "${PORT:-}" "${SERVED_NAME:-}" "${MODEL_DIR:-}" || true
-  cleanup_vllm_worker_residuals || true
-  sleep 1
-  cleanup_vllm_worker_residuals force || true
+  # A failed experiment may share its checkpoint/name with a healthy service.
+  # Use this launch's token (including reparented workers), or its recorded
+  # process tree for legacy launches. Never sweep all same-user vLLM workers.
+  [[ -n "$pid_file" ]] || return 0
+  stop_pid_file "$pid_file"
 }
 
 launch_token_pids() {
@@ -4386,13 +4439,13 @@ stop_service() {
       if [[ -n "$pid_file" ]]; then
         stop_pid_file "$pid_file"
       else
+        local descendants
+        descendants=$(collect_descendant_pids "$pid")
         stop_pid_tree "$pid" || true
         sleep 1
         stop_pid_tree "$pid" force || true
+        stop_recorded_pids "$descendants" force || true
       fi
-      cleanup_vllm_worker_residuals || true
-      sleep 1
-      cleanup_vllm_worker_residuals force || true
       if ! pid_is_running "$pid"; then
         if [[ "${LAST_PID_FILE:-}" == "$pid_file" ]]; then
           clear_last_service_state
@@ -4782,9 +4835,20 @@ validate_mode_kv_policy() {
   esac
 }
 
+configure_kv_hash_seed() {
+  # Older private scripts set the alias only. vLLM reads the actual process
+  # variable; prefer it when explicitly supplied and preserve absence otherwise.
+  if [[ -n "${KV_ROOT:-}${KV_DISK_CACHE_DIR:-}" && -z "${PYTHONHASHSEED:-}" && -n "${KV_PYTHONHASHSEED:-}" ]]; then
+    export PYTHONHASHSEED="$KV_PYTHONHASHSEED"
+  elif [[ -n "${PYTHONHASHSEED:-}" ]]; then
+    export PYTHONHASHSEED
+  fi
+}
+
 set_sm75_runtime_env() {
   local cuda_candidate flashqla_candidate host_compiler_major
   local runtime_cuda_version runtime_parent
+  configure_kv_hash_seed
   HF_ACTIVE_ENDPOINT=""
   HF_ROUTE_MODE_ACTIVE=""
   export STABLE_ROOT="$RUNTIME_ROOT"
@@ -4898,8 +4962,8 @@ set_sm75_runtime_env() {
   fi
   # Keep generated kernels inside this runtime tree. Reusing cache dirs from
   # experiment worktrees can leave absolute paths to deleted environments.
-  export TORCHINDUCTOR_CACHE_DIR="$MANAGER_ROOT/torchinductor-cache"
-  export TRITON_CACHE_DIR="$MANAGER_ROOT/triton-cache"
+  export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/torchinductor-cache"}
+  export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/triton-cache"}
   export PYTHONUNBUFFERED=1
   if [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" ]]; then
     export VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-1}
@@ -4950,8 +5014,11 @@ build_args() {
   elif [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
     VLLM_ARGS+=(--enable-prefix-caching)
   fi
+  validate_disk_kv_cache_config || return 1
   if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
-    VLLM_ARGS+=(--kv-transfer-config "$(disk_kv_transfer_config)")
+    local kv_transfer_config
+    kv_transfer_config=$(disk_kv_transfer_config) || return 1
+    VLLM_ARGS+=(--kv-transfer-config "$kv_transfer_config")
   fi
   [[ "${ENABLE_PROMPT_TOKENS_DETAILS:-1}" == "1" ]] && VLLM_ARGS+=(--enable-prompt-tokens-details)
   [[ "${LANGUAGE_MODEL_ONLY:-0}" == "1" ]] && VLLM_ARGS+=(--language-model-only)
@@ -5275,7 +5342,7 @@ run_compile_prewarm() {
 
   MAX_MODEL_LEN=$prewarm_len
   SERVED_NAME=$prewarm_name
-  build_args "$host_arg"
+  build_args "$host_arg" || return 1
   printf -v args_text '%q ' "${VLLM_ARGS[@]}"
 
   {
@@ -5319,7 +5386,7 @@ run_compile_prewarm() {
   MAX_MODEL_LEN=$original_len
   SERVED_NAME=$original_name
   CURRENT_SERVER_PID=$original_pid
-  build_args "$host_arg"
+  build_args "$host_arg" || return 1
 
   if [[ "$ready_rc" == "130" ]]; then
     [[ "$cleanup_rc" == 0 ]] || return 131
@@ -5672,7 +5739,7 @@ launch_server() {
     url_host="127.0.0.1"
   fi
 
-  build_args "$host_arg"
+  build_args "$host_arg" || return 1
   printf -v args_text '%q ' "${VLLM_ARGS[@]}"
 
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -5680,6 +5747,7 @@ launch_server() {
     echo "DRY RUN"
     echo "Environment:"
     echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+    echo "  PYTHONHASHSEED=${PYTHONHASHSEED:-<unset>}"
     echo "  DFlash draft fetch=$(current_dflash_download_route_label)"
     echo "  VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}"
     echo "  VLLM_DISABLE_TILELANG=${VLLM_DISABLE_TILELANG:-0}"
@@ -5721,6 +5789,7 @@ launch_server() {
     echo "TP/PP rank layout: $(format_tp_rank_groups "${GPU_DEVICES:-}" "${TP_SIZE:-1}" || true)"
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
+    echo "KV hash seed: PYTHONHASHSEED=${PYTHONHASHSEED:-<unset>}"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
     echo "TileLang disabled: ${VLLM_DISABLE_TILELANG:-0}"
     echo "DFlash draft fetch: $(current_dflash_download_route_label)"
