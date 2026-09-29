@@ -40,7 +40,9 @@ required_keys=(
 allowed_key() {
   case "$1" in
     MODE|MODEL_FAMILY|MODEL_VARIANT|QUANTIZATION|KV_CACHE_DTYPE|MAX_MODEL_LEN|GPU_UTIL|\
-MAX_BATCHED_TOKENS|MAX_NUM_SEQS|MESSAGE_TYPE|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|ENABLE_YARN)
+MAX_BATCHED_TOKENS|MAX_NUM_SEQS|MESSAGE_TYPE|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|\
+DISABLE_PREFIX_CACHING|MAMBA_CACHE_MODE|MM_LIMIT_JSON|LANGUAGE_MODEL_ONLY|\
+SKIP_MM_PROFILING|ENABLE_YARN)
       return 0
       ;;
     *)
@@ -80,6 +82,8 @@ expected_profiles=(
   4xT10/qwen27b/w8a16/dflash2-fp8kv-2x220K-text-only.env
   4xT10/qwen27b/w8a16/mtp4-fp8kv-2x262K-text-image.env
   4xT10/qwen27b/w8a16/mtp4-fp16kv-1x262K-text-image.env
+  qwen3.8-27b-2x22g-w8a16-fp8kv-225280-mtp3-text-image5.env
+  qwen3.8-27b-2x22g-w8a16-tqk8v4-262144-mtp3-text-image5.env
 )
 mapfile -t expected_profiles < <(printf '%s\n' "${expected_profiles[@]}" | sort)
 
@@ -199,7 +203,7 @@ while IFS= read -r -d '' file; do
   esac
   case "$profile_name" in
     *text-only.env) [[ "$message_type" == text-only ]] || profile_error "$rel" "text-only filename requires MESSAGE_TYPE=text-only" ;;
-    *text-image.env) [[ "$message_type" == text+image ]] || profile_error "$rel" "text-image filename requires MESSAGE_TYPE=text+image" ;;
+    *text-image*.env) [[ "$message_type" == text+image ]] || profile_error "$rel" "text-image filename requires MESSAGE_TYPE=text+image" ;;
   esac
   case "$speculative_method" in
     none)

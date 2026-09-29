@@ -14,7 +14,7 @@ source "$PROJECT_RELEASE_FILE"
 RUNTIME_ROOT=${RUNTIME_ROOT:-"$MANAGER_ROOT"}
 PROFILE_DIR=${PROFILE_DIR:-"$MANAGER_ROOT/profiles"}
 TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
-LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/run-logs"}
+LOG_DIR=${LOG_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/run-logs"}
 STATE_FILE=${STATE_FILE:-"$LOG_DIR/start-manager.state"}
 STAMP=$(date +%Y%m%d-%H%M%S)
 VERSION=${VERSION:-$FORK_RELEASE}
@@ -833,6 +833,11 @@ ROUTE_PROFILE_KEYS=(
   MAX_NUM_SEQS
   SPECULATIVE_METHOD
   SPECULATIVE_TOKENS
+  DISABLE_PREFIX_CACHING
+  MAMBA_CACHE_MODE
+  MM_LIMIT_JSON
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
   MESSAGE_TYPE
 )
 
@@ -848,6 +853,11 @@ PROFILE_RESET_KEYS=(
   MAX_NUM_SEQS
   SPECULATIVE_METHOD
   SPECULATIVE_TOKENS
+  DISABLE_PREFIX_CACHING
+  MAMBA_CACHE_MODE
+  MM_LIMIT_JSON
+  LANGUAGE_MODEL_ONLY
+  SKIP_MM_PROFILING
   MESSAGE_TYPE
 )
 
@@ -912,6 +922,15 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   FLASHINFER_ENABLE_AOT
   FLASHINFER_WORKSPACE_BASE
   RUN_HOME
+  VLLM_TQ_RESERVE_PREFILL_WORKSPACE
+  KV_ROOT
+  KV_CPU_GIB
+  KV_PIN_MEMORY
+  KV_PYTHONHASHSEED
+  KV_DISK_MAX_GIB
+  KV_DISK_TARGET_GIB
+  KV_DISK_MIN_FREE_GIB
+  KV_DISK_CLEANUP_INTERVAL_SECONDS
 )
 
 NON_INTERACTIVE_BOOLEAN_KEYS=(
@@ -936,6 +955,7 @@ NON_INTERACTIVE_BOOLEAN_KEYS=(
   VLLM_INT8KV_FA_PREFILL
   SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH
   SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION
+  KV_PIN_MEMORY
 )
 
 declare -A CONFIG_FLAG_TO_KEY=()
@@ -1172,7 +1192,9 @@ reset_route_profile_fields() {
 profile_key_is_allowed() {
   case "$1" in
 MODE|MODEL_FAMILY|MODEL_VARIANT|QUANTIZATION|KV_CACHE_DTYPE|ENABLE_YARN|MAX_MODEL_LEN|GPU_UTIL|\
-MAX_BATCHED_TOKENS|MAX_NUM_SEQS|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|MESSAGE_TYPE)
+MAX_BATCHED_TOKENS|MAX_NUM_SEQS|SPECULATIVE_METHOD|SPECULATIVE_TOKENS|\
+DISABLE_PREFIX_CACHING|MAMBA_CACHE_MODE|MM_LIMIT_JSON|LANGUAGE_MODEL_ONLY|\
+SKIP_MM_PROFILING|MESSAGE_TYPE)
       return 0
       ;;
     *)
@@ -1419,6 +1441,15 @@ save_manager_state() {
     printf 'DISABLE_CUSTOM_ALL_REDUCE=%q\n' "${DISABLE_CUSTOM_ALL_REDUCE:-}"
     printf 'DISABLE_LOG_STATS=%q\n' "${DISABLE_LOG_STATS:-}"
     printf 'VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=%q\n' "${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-}"
+    printf 'VLLM_TQ_RESERVE_PREFILL_WORKSPACE=%q\n' "${VLLM_TQ_RESERVE_PREFILL_WORKSPACE:-}"
+    printf 'KV_ROOT=%q\n' "${KV_ROOT:-}"
+    printf 'KV_CPU_GIB=%q\n' "${KV_CPU_GIB:-}"
+    printf 'KV_PIN_MEMORY=%q\n' "${KV_PIN_MEMORY:-}"
+    printf 'KV_PYTHONHASHSEED=%q\n' "${KV_PYTHONHASHSEED:-}"
+    printf 'KV_DISK_MAX_GIB=%q\n' "${KV_DISK_MAX_GIB:-}"
+    printf 'KV_DISK_TARGET_GIB=%q\n' "${KV_DISK_TARGET_GIB:-}"
+    printf 'KV_DISK_MIN_FREE_GIB=%q\n' "${KV_DISK_MIN_FREE_GIB:-}"
+    printf 'KV_DISK_CLEANUP_INTERVAL_SECONDS=%q\n' "${KV_DISK_CLEANUP_INTERVAL_SECONDS:-}"
     printf 'MODE=%q\n' "${MODE:-fast}"
     printf 'PORT=%q\n' "${PORT:-8000}"
     printf 'SERVICE_SCOPE=%q\n' "${SERVICE_SCOPE:-local}"
@@ -4648,8 +4679,8 @@ set_sm75_runtime_env() {
   fi
   # Keep generated kernels inside this runtime tree. Reusing cache dirs from
   # experiment worktrees can leave absolute paths to deleted environments.
-  export TORCHINDUCTOR_CACHE_DIR="$MANAGER_ROOT/torchinductor-cache"
-  export TRITON_CACHE_DIR="$MANAGER_ROOT/triton-cache"
+  export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/torchinductor-cache"}
+  export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-"$MANAGER_ROOT/../vllm-2080ti-definitive-artifacts/triton-cache"}
   export PYTHONUNBUFFERED=1
   if [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" ]]; then
     export VLLM_ENFORCE_STRICT_TOOL_CALLING=${VLLM_ENFORCE_STRICT_TOOL_CALLING:-1}
@@ -4699,6 +4730,35 @@ build_args() {
     VLLM_ARGS+=(--no-enable-prefix-caching)
   elif [[ "${ENABLE_PREFIX_CACHING:-1}" == "1" ]]; then
     VLLM_ARGS+=(--enable-prefix-caching)
+  fi
+  if [[ -n "${KV_ROOT:-}" ]]; then
+    local kv_root=$KV_ROOT
+    local kv_pin_memory=false
+    local kv_cpu_gib=${KV_CPU_GIB:-0}
+    local kv_disk_max_gib=${KV_DISK_MAX_GIB:-0}
+    local kv_disk_target_gib=${KV_DISK_TARGET_GIB:-0}
+    local kv_disk_min_free_gib=${KV_DISK_MIN_FREE_GIB:-0}
+    local kv_cleanup_seconds=${KV_DISK_CLEANUP_INTERVAL_SECONDS:-60}
+    local value kv_transfer_config
+    [[ "$kv_root" == /* ]] || kv_root="$MANAGER_ROOT/$kv_root"
+    kv_root=$(realpath -m -- "$kv_root")
+    [[ "$kv_root" != *'"'* ]] || die "KV_ROOT must not contain a double quote."
+    for value in "$kv_cpu_gib" "$kv_disk_max_gib" "$kv_disk_target_gib" "$kv_disk_min_free_gib" "$kv_cleanup_seconds"; do
+      [[ "$value" =~ ^[0-9]+$ ]] || die "KV offload sizes and cleanup interval must be non-negative integers."
+    done
+    (( kv_cpu_gib > 0 )) || die "KV_CPU_GIB must be greater than zero when KV_ROOT is set."
+    if (( kv_disk_max_gib > 0 )); then
+      (( kv_disk_target_gib > 0 && kv_disk_target_gib <= kv_disk_max_gib )) || die "KV_DISK_TARGET_GIB must be > 0 and <= KV_DISK_MAX_GIB."
+    fi
+    (( kv_cleanup_seconds > 0 )) || die "KV_DISK_CLEANUP_INTERVAL_SECONDS must be greater than zero."
+    [[ "$(normalize_bool "${KV_PIN_MEMORY:-0}")" == "1" ]] && kv_pin_memory=true
+    mkdir -p "$kv_root"
+    printf -v kv_transfer_config \
+      '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"spec_name":"TieringOffloadingSpec","cpu_bytes_to_use":%s,"pin_memory":%s,"secondary_tiers":[{"type":"fs","root_dir":"%s","max_disk_bytes":%s,"target_disk_bytes":%s,"min_disk_free_bytes":%s,"cleanup_interval_seconds":%s}]}}' \
+      "$((kv_cpu_gib * 1024 * 1024 * 1024))" "$kv_pin_memory" "$kv_root" \
+      "$((kv_disk_max_gib * 1024 * 1024 * 1024))" "$((kv_disk_target_gib * 1024 * 1024 * 1024))" \
+      "$((kv_disk_min_free_gib * 1024 * 1024 * 1024))" "$kv_cleanup_seconds"
+    VLLM_ARGS+=(--kv-transfer-config "$kv_transfer_config")
   fi
   [[ "${ENABLE_PROMPT_TOKENS_DETAILS:-1}" == "1" ]] && VLLM_ARGS+=(--enable-prompt-tokens-details)
   [[ "${LANGUAGE_MODEL_ONLY:-0}" == "1" ]] && VLLM_ARGS+=(--language-model-only)
